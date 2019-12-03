@@ -5,10 +5,15 @@ import (
 	"sync"
 	"sync/atomic"
 
-	"github.com/allegro/bigcache/queue"
+	"github.com/allegro/bigcache/v2/queue"
 )
 
 type onRemoveCallback func(wrappedEntry []byte, reason RemoveReason)
+
+// Metadata contains information of a spesific entry
+type Metadata struct {
+	RequestCount uint32
+}
 
 type cacheShard struct {
 	hashmap     map[uint64]uint32
@@ -17,15 +22,69 @@ type cacheShard struct {
 	entryBuffer []byte
 	onRemove    onRemoveCallback
 
-	isVerbose  bool
-	logger     Logger
-	clock      clock
-	lifeWindow uint64
+	isVerbose    bool
+	statsEnabled bool
+	logger       Logger
+	clock        clock
+	lifeWindow   uint64
 
-	stats Stats
+	hashmapStats map[uint64]uint32
+	stats        Stats
+}
+
+func (s *cacheShard) getWithInfo(key string, hashedKey uint64) (entry []byte, resp Response, err error) {
+	currentTime := uint64(s.clock.epoch())
+	wrappedEntry, err := s.getWrappedEntry(key, hashedKey)
+	if err == nil {
+		s.lock.RLock()
+		if entryKey := readKeyFromEntry(wrappedEntry); key != entryKey {
+			if s.isVerbose {
+				s.logger.Printf("Collision detected. Both %q and %q have the same hash %x", key, entryKey, hashedKey)
+			}
+			s.lock.RUnlock()
+			s.collision()
+			return entry, resp, ErrEntryNotFound
+		}
+
+		oldestTimeStamp := readTimestampFromEntry(wrappedEntry)
+		if currentTime-oldestTimeStamp >= s.lifeWindow {
+			s.lock.RUnlock()
+			// @TODO: when Expired is non-default value return err as nil as the resp will have proper entry status
+			resp.EntryStatus = Expired
+			return entry, resp, ErrEntryIsDead
+		}
+		entry := readEntry(wrappedEntry)
+		s.lock.RUnlock()
+		s.hit(hashedKey)
+		return entry, resp, nil
+	}
+	// it is nil & error
+	return wrappedEntry, resp, err
 }
 
 func (s *cacheShard) get(key string, hashedKey uint64) ([]byte, error) {
+	wrappedEntry, err := s.getWrappedEntry(key, hashedKey)
+	if err == nil {
+		s.lock.RLock()
+		if entryKey := readKeyFromEntry(wrappedEntry); key != entryKey {
+			if s.isVerbose {
+				s.logger.Printf("Collision detected. Both %q and %q have the same hash %x", key, entryKey, hashedKey)
+			}
+			s.lock.RUnlock()
+			s.collision()
+			return nil, ErrEntryNotFound
+		}
+		entry := readEntry(wrappedEntry)
+		s.lock.RUnlock()
+		s.hit(hashedKey)
+
+		return entry, nil
+	}
+	// it is nil & error
+	return wrappedEntry, err
+}
+
+func (s *cacheShard) getWrappedEntry(key string, hashedKey uint64) ([]byte, error) {
 	s.lock.RLock()
 	itemIndex := s.hashmap[hashedKey]
 
@@ -36,23 +95,13 @@ func (s *cacheShard) get(key string, hashedKey uint64) ([]byte, error) {
 	}
 
 	wrappedEntry, err := s.entries.Get(int(itemIndex))
+	s.lock.RUnlock()
 	if err != nil {
-		s.lock.RUnlock()
 		s.miss()
 		return nil, err
 	}
-	if entryKey := readKeyFromEntry(wrappedEntry); key != entryKey {
-		if s.isVerbose {
-			s.logger.Printf("Collision detected. Both %q and %q have the same hash %x", key, entryKey, hashedKey)
-		}
-		s.lock.RUnlock()
-		s.collision()
-		return nil, ErrEntryNotFound
-	}
-	entry := readEntry(wrappedEntry)
-	s.lock.RUnlock()
-	s.hit()
-	return entry, nil
+
+	return wrappedEntry, err
 }
 
 func (s *cacheShard) set(key string, hashedKey uint64, entry []byte) error {
@@ -85,7 +134,7 @@ func (s *cacheShard) set(key string, hashedKey uint64, entry []byte) error {
 	}
 }
 
-func (s *cacheShard) del(key string, hashedKey uint64) error {
+func (s *cacheShard) del(hashedKey uint64) error {
 	// Optimistic pre-check using only readlock
 	s.lock.RLock()
 	itemIndex := s.hashmap[hashedKey]
@@ -124,6 +173,9 @@ func (s *cacheShard) del(key string, hashedKey uint64) error {
 
 		delete(s.hashmap, hashedKey)
 		s.onRemove(wrappedEntry, Deleted)
+		if s.statsEnabled {
+			delete(s.hashmapStats, hashedKey)
+		}
 		resetKeyFromEntry(wrappedEntry)
 	}
 	s.lock.Unlock()
@@ -186,6 +238,9 @@ func (s *cacheShard) removeOldestEntry(reason RemoveReason) error {
 		hash := readHashFromEntry(oldest)
 		delete(s.hashmap, hash)
 		s.onRemove(oldest, reason)
+		if s.statsEnabled {
+			delete(s.hashmapStats, hash)
+		}
 		return nil
 	}
 	return err
@@ -224,8 +279,19 @@ func (s *cacheShard) getStats() Stats {
 	return stats
 }
 
-func (s *cacheShard) hit() {
+func (s *cacheShard) getKeyMetadata(key uint64) Metadata {
+	return Metadata{
+		RequestCount: s.hashmapStats[key],
+	}
+}
+
+func (s *cacheShard) hit(key uint64) {
 	atomic.AddInt64(&s.stats.Hits, 1)
+	if s.statsEnabled {
+		s.lock.RLock()
+		s.hashmapStats[key]++
+		s.lock.RUnlock()
+	}
 }
 
 func (s *cacheShard) miss() {
@@ -246,14 +312,16 @@ func (s *cacheShard) collision() {
 
 func initNewShard(config Config, callback onRemoveCallback, clock clock) *cacheShard {
 	return &cacheShard{
-		hashmap:     make(map[uint64]uint32, config.initialShardSize()),
-		entries:     *queue.NewBytesQueue(config.initialShardSize()*config.MaxEntrySize, config.maximumShardSize(), config.Verbose),
-		entryBuffer: make([]byte, config.MaxEntrySize+headersSizeInBytes),
-		onRemove:    callback,
+		hashmap:      make(map[uint64]uint32, config.initialShardSize()),
+		hashmapStats: make(map[uint64]uint32, config.initialShardSize()),
+		entries:      *queue.NewBytesQueue(config.initialShardSize()*config.MaxEntrySize, config.maximumShardSize(), config.Verbose),
+		entryBuffer:  make([]byte, config.MaxEntrySize+headersSizeInBytes),
+		onRemove:     callback,
 
-		isVerbose:  config.Verbose,
-		logger:     newLogger(config.Logger),
-		clock:      clock,
-		lifeWindow: uint64(config.LifeWindow.Seconds()),
+		isVerbose:    config.Verbose,
+		logger:       newLogger(config.Logger),
+		clock:        clock,
+		lifeWindow:   uint64(config.LifeWindow.Seconds()),
+		statsEnabled: config.StatsEnabled,
 	}
 }

@@ -275,6 +275,39 @@ func TestOnRemoveFilter(t *testing.T) {
 	assert.True(t, onRemoveInvoked)
 }
 
+func TestOnRemoveGetEntryStats(t *testing.T) {
+	t.Parallel()
+
+	// given
+	clock := mockedClock{value: 0}
+	count := uint32(0)
+	onRemove := func(key string, entry []byte, keyMetadata Metadata) {
+		count = keyMetadata.RequestCount
+	}
+	c := Config{
+		Shards:               1,
+		LifeWindow:           time.Second,
+		MaxEntriesInWindow:   1,
+		MaxEntrySize:         256,
+		OnRemoveWithMetadata: onRemove,
+		StatsEnabled:         true,
+	}.OnRemoveFilterSet(Deleted, NoSpace)
+
+	cache, _ := newBigCache(c, &clock)
+
+	// when
+	cache.Set("key", []byte("value"))
+
+	for i := 0; i < 100; i++ {
+		cache.Get("key")
+	}
+
+	cache.Delete("key")
+
+	// then
+	assert.Equal(t, uint32(100), count)
+}
+
 func TestCacheLen(t *testing.T) {
 	t.Parallel()
 
@@ -294,6 +327,28 @@ func TestCacheLen(t *testing.T) {
 
 	// then
 	assert.Equal(t, keys, cache.Len())
+}
+
+func TestCacheCapacity(t *testing.T) {
+	t.Parallel()
+
+	// given
+	cache, _ := NewBigCache(Config{
+		Shards:             8,
+		LifeWindow:         time.Second,
+		MaxEntriesInWindow: 1,
+		MaxEntrySize:       256,
+	})
+	keys := 1337
+
+	// when
+	for i := 0; i < keys; i++ {
+		cache.Set(fmt.Sprintf("key%d", i), []byte("value"))
+	}
+
+	// then
+	assert.Equal(t, keys, cache.Len())
+	assert.Equal(t, 81920, cache.Capacity())
 }
 
 func TestCacheStats(t *testing.T) {
@@ -336,6 +391,29 @@ func TestCacheStats(t *testing.T) {
 	assert.Equal(t, stats.Misses, int64(10))
 	assert.Equal(t, stats.DelHits, int64(10))
 	assert.Equal(t, stats.DelMisses, int64(10))
+}
+func TestCacheEntryStats(t *testing.T) {
+	t.Parallel()
+
+	// given
+	cache, _ := NewBigCache(Config{
+		Shards:             8,
+		LifeWindow:         time.Second,
+		MaxEntriesInWindow: 1,
+		MaxEntrySize:       256,
+		StatsEnabled:       true,
+	})
+
+	cache.Set("key0", []byte("value"))
+
+	for i := 0; i < 10; i++ {
+		_, err := cache.Get("key0")
+		assert.Nil(t, err)
+	}
+
+	// then
+	keyMetadata := cache.KeyMetadata("key0")
+	assert.Equal(t, uint32(10), keyMetadata.RequestCount)
 }
 
 func TestCacheDel(t *testing.T) {
@@ -701,6 +779,57 @@ func TestClosing(t *testing.T) {
 	endGR := runtime.NumGoroutine()
 	assert.True(t, endGR >= startGR)
 	assert.InDelta(t, endGR, startGR, 25)
+}
+
+func TestEntryNotPresent(t *testing.T) {
+	t.Parallel()
+
+	// given
+	clock := mockedClock{value: 0}
+	cache, _ := newBigCache(Config{
+		Shards:             1,
+		LifeWindow:         5 * time.Second,
+		MaxEntriesInWindow: 1,
+		MaxEntrySize:       1,
+		HardMaxCacheSize:   1,
+	}, &clock)
+
+	// when
+	value, resp, err := cache.GetWithInfo("blah")
+	assert.Error(t, err)
+	assert.Equal(t, resp.EntryStatus, RemoveReason(0))
+	assert.Equal(t, cache.Stats().Misses, int64(1))
+	assert.Nil(t, value)
+}
+
+func TestBigCache_GetWithInfo(t *testing.T) {
+	t.Parallel()
+
+	// given
+	clock := mockedClock{value: 0}
+	cache, _ := newBigCache(Config{
+		Shards:             1,
+		LifeWindow:         5 * time.Second,
+		CleanWindow:        5 * time.Minute,
+		MaxEntriesInWindow: 1,
+		MaxEntrySize:       1,
+		HardMaxCacheSize:   1,
+		Verbose:            true,
+	}, &clock)
+	key := "deadEntryKey"
+	value := "100"
+	cache.Set(key, []byte(value))
+
+	// when
+	data, resp, err := cache.GetWithInfo(key)
+	assert.Equal(t, []byte(value), data)
+	assert.NoError(t, err)
+	assert.Equal(t, Response{}, resp)
+	clock.set(5)
+	data, resp, err = cache.GetWithInfo(key)
+	assert.Equal(t, err, ErrEntryIsDead)
+	assert.Equal(t, Response{EntryStatus: Expired}, resp)
+	assert.Nil(t, data)
 }
 
 type mockedLogger struct {
